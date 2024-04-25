@@ -1,0 +1,19 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API for utility functionality on ogbix
+Globals:
+  Function:
+    Runtime: python3.12
+    Tracing: Active
+Resources:
+  Dataframes:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: dataframes/
+      Handler: dataframes.handler                          
+      Runtime: python3.12
+      MemorySize: 3008
+      Timeout: 300
+      Policies: 
+      - AmazonDynamoDBReadOnlyAccess  
+      - AmazonS3FullAccess
