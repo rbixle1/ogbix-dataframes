@@ -1,13 +1,24 @@
 import json
 import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
-from song_stemmer import key_builder
 import pandas as pd
-import io
+from playwright.sync_api import sync_playwright, Playwright
 
-
-START_DATE = datetime.now() 
+HEADLESS = False
+START_DATE = datetime.now()
 dynamodb = boto3.resource('dynamodb')
+s3_client = boto3.client("s3")
+city_chart = dynamodb.Table('Charts')
+keys_table = dynamodb.Table('Keys')
+
+
+def get_days(days_to_process): 
+    date_list = [] 
+    for n in range(days_to_process):
+        date_list.append(datetime.strftime((START_DATE - timedelta(n)), '%m-%d-%Y'))
+    return date_list
 
 def fmt_response(status_code, body):  
     return {
@@ -20,77 +31,117 @@ def fmt_response(status_code, body):
         'body':  body
     }
 
-def get_days(days_to_process):
-    date_list = [] 
-    for n in range(days_to_process):
-        date_list.append(datetime.strftime((START_DATE - timedelta(n)), '%m-%d-%Y'))
-    return date_list
 
+# # If you found a key insert it into the database
+# def add_keys(key, ids, song, band):
+#     dyanamodb = boto3.resource('dynamodb')
+#     keys_table = dyanamodb.Table('Keys')
+#     print("Adding Keys....")
+#     for id in ids:
+#         try:
+#             keys_table.put_item(
+#                 Item={
+#                     "song_hash": key,
+#                     "video": id,
+#                     "track": {"song": song, "band": band},
+#                 }
+#             )
+#         except ClientError as err:
+#             print(
+#                 "Couldn't key %s to table %s. Here's why: %s: %s",
+#                 id,
+#                 'Keys',
+#                 err.response["Error"]["Code"],
+#                 err.response["Error"]["Message"],
+#             )
 
-def get_list(city, date):
-    client = boto3.client('s3', region_name='us-west-2')
-    paginator = client.get_paginator('list_objects_v2')
+def first_search(page):
+    find_results = page.locator('cite:has-text("https://www.youtube.com/watch?v=")')
+    # get the number of elements/tags
+    count = find_results.count()
+    ids = []
+    # loop through all elements/tags
+    for i in range(count):
+        # get the element/tag
+        element = find_results.nth(i)
+        # get the text of the element/tag
+        ids.append(element.inner_text().removeprefix('https://www.youtube.com/watch?v='))
+    return ids
 
+# Search and scrape to get the data for the video key.
+def find_video_key(playwright: Playwright, song, artist, key):
+    print("Searching for video key.... Band: " + artist + " Song: " + song) 
+    webkit = playwright.webkit
+    #browser = webkit.launch(headless = HEADLESS, slow_mo=5000)
+    browser = webkit.launch(headless = HEADLESS, slow_mo=5000)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto(" https://www.bing.com/search?q=" + song + ' ' + artist + ' youtube (official video) ')
+    
+    ids = first_search(page)
 
-    s3 = boto3.resource('s3')
-    song_list = {}
+    if(len(ids) > 0):
+        print(ids)
+        #add_keys(key, ids, song, band)
 
-    page_iterator = paginator.paginate(Bucket='tracks.json',
-            Prefix="tracks/" + city + "/"+ date + "/") # only this city
-    for page in page_iterator:
+    browser.close()
+    
+    
+def check_for_video_key(song, artist, key):
 
-        # Aggregate the bucket
-        print('Aggregating songs....:' + date)
-        try:
-            for obj in page['Contents']:
-                song_bucket = obj['Key']
-            
-                track = s3.Object('tracks.json', song_bucket)
-                
-                song = json.loads(track.get()['Body'].read())
-                #print(song)
+   #print("Checking for video key...." + song + ' ' + artist + ' : ' + key)
+    try:
+        response = keys_table.query(KeyConditionExpression=Key('song_hash').eq(key))
+    except ClientError as err:
+        print(
+            "Couldn't get item %s from table %s. Here's why: %s: %s",
+            key,
+            'Keys',
+            err.response["Error"]["Code"],
+            err.response["Error"]["Message"],
+        )    
+        return False
+    if response['Count'] > 0:
+        return True
+    return False
 
-                # Get the songs hash key
-                key = key_builder( song['song'] + ' ' + song['band'])
+def process_songs(df):
+    local_df = df.groupby(['key', 'song', 'artist']).sum(['count'])
+    local_df = local_df.sort_values(by=['count'], ascending=False).reset_index()
+    x = 0
+    y = 0
 
-                # Creat a list of occurances of the song.
-                if key in song_list :
-                    song_list[key][0] = song_list[key][0] + 1
-                else:
-                    song_list.update({key: [1, song['song'], song['band'], key, city, date]})
-        except KeyError as err:
-            print('Error: ' + str(err)) 
-    return song_list
+    for index, item in local_df.iterrows():
+        x = x + 1
 
+        if check_for_video_key(item['song'], item['artist'], item['key']) == False:
+            y = y + 1
+            with sync_playwright() as playwright: 
+                find_video_key(playwright, item['song'], item['artist'], item['key'])
+    print('Total not found: ' + str(y))            
+    
+    
 def handler(event, context):
-    print(pd.__version__)
-
-    # loop through cities
-    dyanamodb = boto3.resource('dynamodb')
-    all_stations = dyanamodb.Table('Stations')
-    stations = all_stations.scan()
-    cities = [] # Get cities to process from DynamoDB Stations table.
-    cities.extend(stations.get("Items", []))
-
-
-
-    global_list = {}
+    # Aggregate N days of stats as df
     days = get_days(1)
-    for day in days:
-        combined_df = pd.DataFrame()
-        for city in cities:
-            print('Processing: ' + city['City'].replace(' ', '') + ' ...')
-            song_list = get_list(city['City'].replace(' ', ''),day)
-            df = pd.DataFrame(song_list.values())
-            combined_df = pd.concat([combined_df, df])
-            print(df)
-        #Save todays bucket    
-        combined_df.columns = ['count', 'song', 'artist', 'key', 'city', 'date']
-        bucket = 'daily-statistics'
-        destination = day + '/aggregated-daily.json'
-        json_buffer = io.StringIO()
-        combined_df.to_json(json_buffer,orient='records')
-        s3 = boto3.resource('s3')
-        s3_bucket = s3.Bucket(bucket)
-        s3_bucket.put_object(Key=destination, Body=json_buffer.getvalue())
-        return fmt_response(200, 'processed')
+    
+    print('Processing days ... ' + str(days))
+    
+    df = pd.DataFrame()
+    for date in days:
+        object_key = date + "/aggregated-daily.json"
+        file_content = s3_client.get_object(
+            Bucket='daily-statistics', Key=object_key)
+        df = pd.concat([df, pd.read_json(file_content['Body'])])
+        
+    df['song']= df['song'].str.title()
+    df['artist']= df['artist'].str.title()
+
+    print('Processing: keys ...')     
+    process_songs(df) 
+
+
+    return fmt_response(200, 'processed')
+
+
+handler('','')

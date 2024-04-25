@@ -11,9 +11,18 @@ Resources:
     Properties:
       CodeUri: dataframes/
       Handler: dataframes.handler                          
-      Runtime: python3.12
       MemorySize: 3008
       Timeout: 300
       Policies: 
       - AmazonDynamoDBReadOnlyAccess  
       - AmazonS3FullAccess
+  Keybuilder:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: keybuilder/
+      Handler: keybuilder.handler                          
+      MemorySize: 3008
+      Timeout: 300
+      Policies: 
+      - AmazonDynamoDBFullAccess 
+      - AmazonS3ReadOnlyAccess
